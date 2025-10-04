@@ -1,0 +1,183 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from tkinter import Tk, filedialog
+from datetime import datetime, timezone
+from matplotlib.colors import Normalize
+
+# --- Helper: Select a folder ---
+def select_folder(title):
+    root = Tk()
+    root.withdraw()
+    folder = filedialog.askdirectory(title=title)
+    root.destroy()
+    if not folder:
+        print("Folder selection cancelled.")
+        exit()
+    return folder
+
+# --- Helper: Logarithmic scaling ---
+def scale_counts(counts):
+    scaled = (np.log1p(counts) ** 0.6)
+    scaled /= np.max(scaled) if np.max(scaled) > 0 else 1
+    return scaled
+
+# --- Helper: Create colormap ---
+def create_colormap(color):
+    from matplotlib.colors import LinearSegmentedColormap
+    cdict = {
+        'red':   ((0, 1, 1), (1, color[0], color[0])),
+        'green': ((0, 1, 1), (1, color[1], color[1])),
+        'blue':  ((0, 1, 1), (1, color[2], color[2]))
+    }
+    return LinearSegmentedColormap('custom_cmap', segmentdata=cdict, N=256)
+
+# --- Step 1: Select folders ---
+folder1 = select_folder("Select First Folder Containing Excel Files")
+folder2 = select_folder("Select Second Folder Containing Excel Files")
+
+# --- Step 2: Collect .csv files ---
+excel_files1 = [os.path.join(folder1, f) for f in os.listdir(folder1) if f.lower().endswith('.csv')]
+excel_files2 = [os.path.join(folder2, f) for f in os.listdir(folder2) if f.lower().endswith('.csv')]
+
+if not excel_files1:
+    print("No Excel files found in the first folder.")
+    exit()
+if not excel_files2:
+    print("No Excel files found in the second folder.")
+    exit()
+
+# --- Step 3: Process pairs ---
+points = []
+
+num_pairs = min(len(excel_files1), len(excel_files2))
+for idx in range(num_pairs):
+    file1 = excel_files1[idx]
+    file2 = excel_files2[idx]
+
+    print(f"\nProcessing pair:\n  File 1: {file1}\n  File 2: {file2}")
+
+    # Read data
+    try:
+        data1 = pd.read_csv(file1, header=None)
+    except pd.errors.EmptyDataError:
+        print(f"File 1 is empty: {file1}, skipping...")
+        continue
+
+    try:
+        data2 = pd.read_csv(file2, header=None)
+    except pd.errors.EmptyDataError:
+        print(f"File 2 is empty: {file2}, skipping...")
+        continue
+
+    if data2.empty or data2.shape[0] < 10:
+        print("Measured values spreadsheet is empty or has fewer than ten rows, skipping...")
+        continue
+
+    columnB_str = data1.iloc[:, 1].astype(str)
+
+    for _, row in data2.iterrows():
+        if pd.isna(row[0]):
+            continue
+
+        # --- Time conversion ---
+        ts_ns = float(row[0])
+        ts_s = ts_ns / 1e9
+        dt = datetime.fromtimestamp(ts_s, tz=timezone.utc)
+        dt_rounded = dt.replace(second=0, microsecond=0)
+        time_str = dt_rounded.strftime("%H:%M:%S")
+
+        # --- Find matching row in data1 ---
+        match_idx = columnB_str[columnB_str == time_str].index
+        if len(match_idx) > 0:
+            idx_match = match_idx[0]
+            Alt = float(data1.iloc[idx_match, 9])
+            CPos = float(data1.iloc[idx_match, 10])
+
+            if Alt >= 0:
+                if data2.shape[1] >= 10:
+                    Vblock = row.iloc[2:6].astype(float)
+                    Iblock = row.iloc[6:10].astype(float)
+                    Vol = Vblock.max()
+                    Cur = Iblock.max()
+
+                    points.append([CPos, Alt, Vol, Cur])
+                    print("Point created.")
+            else:
+                print("Altitude < 0, skipping point.")
+        else:
+            print("No matches found for this time.")
+
+points = np.array(points)
+if points.size == 0:
+    print("No points collected.")
+    exit()
+
+# --- Step 4: Split into red/blue ---
+red_points = []
+blue_points = []
+
+for p in points:
+    CPos, Alt, Vol, Cur = p
+    if 41.25 <= Vol <= 41.75:
+        blue_points.append(p)
+    elif 43.75 <= Vol <= 44.25 and 4 <= Cur <= 9:
+        red_points.append(p)
+
+red_points = np.array(red_points)
+blue_points = np.array(blue_points)
+
+# --- Step 5: Heatmap bins ---
+x_edges = np.arange(0, 1.1, 0.1)
+y_edges = np.arange(0, 110, 10)
+
+counts_red, _, _ = np.histogram2d(red_points[:, 0], red_points[:, 1], bins=[x_edges, y_edges])
+counts_blue, _, _ = np.histogram2d(blue_points[:, 0], blue_points[:, 1], bins=[x_edges, y_edges])
+
+# Add border for patch plotting
+counts_red = np.pad(counts_red, ((0,1),(0,1)), 'constant')
+counts_blue = np.pad(counts_blue, ((0,1),(0,1)), 'constant')
+
+# Scale counts
+red_scaled = scale_counts(counts_red)
+blue_scaled = scale_counts(counts_blue)
+
+# --- Step 6: Plot ---
+fig, ax = plt.subplots()
+ax.set_aspect('auto')
+ax.set_xlabel("Illumination")
+ax.set_ylabel("Altitude")
+ax.set_title("Split-Cell Red/Blue Heatmap")
+ax.set_xticks(np.arange(0, 1.1, 0.1))
+ax.set_yticks(np.arange(0, 110, 10))
+ax.set_xlim(0, 1)
+ax.set_ylim(0, 100)
+
+for ix in range(len(x_edges)-1):
+    for iy in range(len(y_edges)-1):
+        x0, x1 = x_edges[ix], x_edges[ix+1]
+        y0, y1 = y_edges[iy], y_edges[iy+1]
+
+        # Red lower-left triangle
+        red_val = red_scaled[ix, iy]
+        red_color = np.array([1, 1 - red_val, 1 - red_val])
+        ax.fill([x0, x1, x0], [y0, y0, y1], color=red_color, edgecolor='k', linewidth=0.2)
+
+        # Blue upper-right triangle
+        blue_val = blue_scaled[ix, iy]
+        blue_color = np.array([1 - blue_val, 1 - blue_val, 1])
+        ax.fill([x1, x0, x1], [y1, y1, y0], color=blue_color, edgecolor='k', linewidth=0.2)
+
+# Separate colorbars
+norm_red = Normalize(vmin=0, vmax=np.max(counts_red))
+norm_blue = Normalize(vmin=0, vmax=np.max(counts_blue))
+cb_red = plt.colorbar(plt.cm.ScalarMappable(norm=norm_red, cmap=create_colormap([1, 0, 0])),
+                      ax=ax, fraction=0.046, pad=0.04)
+cb_red.set_label("Red Counts")
+
+cb_blue = plt.colorbar(plt.cm.ScalarMappable(norm=norm_blue, cmap=create_colormap([0, 0, 1])),
+                       ax=ax, fraction=0.046, pad=0.12)
+cb_blue.set_label("Blue Counts")
+
+plt.show()
